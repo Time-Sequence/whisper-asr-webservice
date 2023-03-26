@@ -82,7 +82,6 @@ def transcribe(
 def task(id: str):
     print(id)
     t = r.get(getTaskId(id))
-    print(t)
     try:
         return json.loads(t)
     except:
