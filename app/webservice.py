@@ -1,21 +1,23 @@
 from fastapi import FastAPI, File, UploadFile, Query, applications
-from fastapi.responses import StreamingResponse, RedirectResponse
+from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.openapi.docs import get_swagger_ui_html
 import whisper
-from whisper.utils import ResultWriter, WriteTXT, WriteSRT, WriteVTT, WriteTSV, WriteJSON
 from whisper import tokenizer
 import os
+import json
 from os import path
-from pathlib import Path
 import ffmpeg
 from typing import BinaryIO, Union
 import numpy as np
-from io import StringIO
-from threading import Lock
+from nanoid import generate
+from threading import Lock, Thread
 import torch
 import fastapi_offline_swagger_ui
-import importlib.metadata 
+import redis
+import importlib.metadata
+
+r = redis.Redis(host='localhost', port=6379, db=9)
 
 SAMPLE_RATE=16000
 LANGUAGE_CODES=sorted(list(tokenizer.LANGUAGES.keys()))
@@ -68,25 +70,23 @@ def transcribe(
                 output : Union[str, None] = Query(default="txt", enum=[ "txt", "vtt", "srt", "tsv", "json"]),
                 ):
 
-    result = run_asr(audio_file.file, task, language, initial_prompt)
-    filename = audio_file.filename.split('.')[0]
-    myFile = StringIO()
-    if(output == "srt"):
-        WriteSRT(ResultWriter).write_result(result, file = myFile)
-    elif(output == "vtt"):
-        WriteVTT(ResultWriter).write_result(result, file = myFile)
-    elif(output == "tsv"):
-        WriteTSV(ResultWriter).write_result(result, file = myFile)
-    elif(output == "json"):
-        WriteJSON(ResultWriter).write_result(result, file = myFile)
-    elif(output == "txt"):
-        WriteTXT(ResultWriter).write_result(result, file = myFile)
-    else:
-        return 'Please select an output method!'
-    myFile.seek(0)
-    return StreamingResponse(myFile, media_type="text/plain", 
-                            headers={'Content-Disposition': f'attachment; filename="{filename}.{output}"'})
+    id = generate()
+    data = { 'id': id, 'task': task, 'language': language, 'initial_prompt': initial_prompt }
+    str = json.dumps(data)
+    r.set(getTaskId(id), str)
+    t = Thread(target=run_asr, args=(audio_file.file, task, language, initial_prompt, id))
+    t.start()
+    return {task: id}
 
+@app.get("/task", tags=["Endpoints"])
+def task(id: str):
+    print(id)
+    t = r.get(getTaskId(id))
+    print(t)
+    try:
+        return json.loads(t)
+    except:
+        return {'error': 'Invalid'}
 
 @app.post("/detect-language", tags=["Endpoints"])
 def language_detection(
@@ -104,23 +104,31 @@ def language_detection(
     with model_lock:
         _, probs = model.detect_language(mel)
     detected_lang_code = max(probs, key=probs.get)
-    
+
     result = { "detected_language": tokenizer.LANGUAGES[detected_lang_code],
               "language_code" : detected_lang_code }
 
     return result
 
 
-def run_asr(file: BinaryIO, task: Union[str, None], language: Union[str, None], initial_prompt: Union[str, None] ):
+def run_asr(file: BinaryIO, task: Union[str, None], language: Union[str, None], initial_prompt: Union[str, None], id: str):
     audio = load_audio(file)
     options_dict = {"task" : task}
     if language:
-        options_dict["language"] = language    
+        options_dict["language"] = language
     if initial_prompt:
-        options_dict["initial_prompt"] = initial_prompt    
-    with model_lock:   
+        options_dict["initial_prompt"] = initial_prompt
+    with model_lock:
         result = model.transcribe(audio, **options_dict)
-        
+
+    i = getTaskId(id)
+    j = r.get(i)
+    try:
+        v = json.loads(j)
+        v.update({'result': result})
+        r.set(i, json.dumps(v))
+    except:
+        print('Error')
     return result
 
 
@@ -150,3 +158,6 @@ def load_audio(file: BinaryIO, sr: int = SAMPLE_RATE):
         raise RuntimeError(f"Failed to load audio: {e.stderr.decode()}") from e
 
     return np.frombuffer(out, np.int16).flatten().astype(np.float32) / 32768.0
+
+def getTaskId(id):
+    return 'task_' + id
